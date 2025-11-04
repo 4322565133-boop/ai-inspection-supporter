@@ -1,23 +1,8 @@
-# Streamlit Framework
 streamlit
-
-# Google Gemini API
 google-generativeai
-
-# Environment Variables
 python-dotenv
-
-# YOLOv8 Object Detection
 ultralytics
-
-# Image processing library (required by ultralytics and for drawing)
 opencv-python-headless
-
-# Pillow (PIL) for image handling
 Pillow
-
-# Numpy for image array operations
 numpy
-
-# The missing helper library for Hugging Face downloads
 huggingface-hub
