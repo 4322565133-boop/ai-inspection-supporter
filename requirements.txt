@@ -6,3 +6,4 @@ opencv-python-headless
 Pillow
 numpy
 huggingface-hub
+cv2
