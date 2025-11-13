@@ -4,7 +4,7 @@
 # Description: This version fixes the NameError caused by a typo
 #              in the st.file_uploader 'type' list.
 #
-# Author: Your Name (inspired by Gemini)
+# Author: HU KAIXIAO 
 # Date: 2025-10-28
 # ==============================================================================
 
