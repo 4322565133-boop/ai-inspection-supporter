@@ -1,223 +1,297 @@
 # ==============================================================================
-# AI Inspection Supporter - Main Application (v9 - Syntax Fix)
+# AI Inspection Supporter - Main Application
 #
-# Description: This version fixes the NameError caused by a typo
-#              in the st.file_uploader 'type' list.
+# What this app does:
+# 1) Detects PCB defects using a YOLOv8 model (weights hosted on Hugging Face).
+# 2) Generates a concise QC report using Google Gemini (Generative AI).
 #
-# Author: Your Name (inspired by Gemini)
-# Date: 2025-10-28
+# Key fixes in this version:
+# - Use stable Gemini model names (avoid preview model names that can disappear).
+# - Add robust Gemini model fallback logic via list_models().
+# - Separate .env and .gitignore responsibilities (security best practice).
+# - Fix color-space handling (OpenCV drawing in BGR, display in RGB).
+#
+# Author: HU KAIXIAO
 # ==============================================================================
 
-import streamlit as st
-import google.generativeai as genai
-from dotenv import load_dotenv
 import os
-from PIL import Image
+import streamlit as st
 import numpy as np
-import cv2  # OpenCV for drawing bounding boxes
+import cv2
+from PIL import Image
+from dotenv import load_dotenv
+
+import google.generativeai as genai
 from ultralytics import YOLO
-# We are now explicitly using hf_hub_download
 from huggingface_hub import hf_hub_download
 
-# --- PAGE CONFIGURATION ---
+
+# -----------------------------
+# Page configuration
+# -----------------------------
 st.set_page_config(
     page_title="AI Inspection Supporter",
     page_icon="🤖",
     layout="wide"
 )
 
-# --- MODEL LOADING (MODIFIED with ROBUST Flow) ---
 
+# -----------------------------
+# Utilities: key loading
+# -----------------------------
+def get_google_api_key() -> str | None:
+    """
+    Retrieve the Google API key from (1) Streamlit secrets, or (2) local .env file.
+
+    This allows:
+    - Local development via .env
+    - Streamlit Community Cloud deployment via Secrets
+    """
+    # 1) Streamlit secrets (recommended in deployment)
+    if "GOOGLE_API_KEY" in st.secrets:
+        return st.secrets["GOOGLE_API_KEY"]
+
+    # 2) Local .env for dev
+    load_dotenv()
+    return os.getenv("GOOGLE_API_KEY")
+
+
+# -----------------------------
+# Model loading: YOLO
+# -----------------------------
 @st.cache_resource
 def load_yolo_model():
     """
-    Load the pre-trained YOLOv8 model for PCB defect detection.
-    This function explicitly downloads the model file from Hugging Face
-    (like the music project did) and then loads it from the local path.
+    Load the YOLOv8 model for PCB defect detection.
+    Downloads the weights explicitly from Hugging Face, then loads from local path.
     """
+    st.write("")  # No-op to avoid Streamlit warnings in some environments
     print("[INFO] Loading YOLOv8 PCB Defect Model...")
-    
-    # Define the model repo and file on Hugging Face
+
     model_id = "keremberke/yolov8s-pcb-defect-segmentation"
-    filename = "best.pt" # The actual weights file in that repo
+    filename = "best.pt"
 
     try:
-        #
-        # THIS IS THE "MUSIC PROJECT" FLOW
-        #
-        # Step 1: Explicitly download the model file.
-        # This function is smart and will use a cache.
-        print(f"[INFO] Downloading model file '{filename}' from repo '{model_id}'...")
+        print(f"[INFO] Downloading weights '{filename}' from '{model_id}'...")
         local_model_path = hf_hub_download(repo_id=model_id, filename=filename)
-        print(f"[INFO] Model file is ready at local path: {local_model_path}")
+        print(f"[INFO] Weights downloaded/cached at: {local_model_path}")
 
-        # Step 2: Load the model from the *local downloaded path*
-        # Now YOLO has no ambiguity, it's loading a real file path.
         model = YOLO(local_model_path)
-        
-        print("[INFO] YOLOv8 Model loaded successfully.")
+        print("[INFO] YOLO model loaded successfully.")
         return model
-        
+
     except Exception as e:
-        st.error(f"Failed to download or load the YOLO model '{model_id}'. Error: {e}")
-        print(f"[ERROR] Failed to load YOLO model: {e}")
+        print(f"[ERROR] YOLO loading failed: {e}")
+        st.error(f"Failed to download or load YOLO model: {e}")
         return None
 
+
+# -----------------------------
+# Model loading: Gemini
+# -----------------------------
 @st.cache_resource
-def configure_gemini_api():
+def configure_gemini_model():
     """
-    Configure and initialize the Google Gemini generative model.
+    Configure Gemini and return a usable GenerativeModel instance.
+
+    Why fallback logic:
+    - Some model names can be unavailable depending on API/SDK versions.
+    - Preview model names can be removed or renamed, causing 404 errors.
     """
-    print("[INFO] Configuring Gemini API...")
-    load_dotenv()
-    api_key = os.getenv("GOOGLE_API_KEY")
+    print("[INFO] Configuring Gemini model...")
+
+    api_key = get_google_api_key()
     if not api_key:
-        st.error("Google API Key not found. Please set it in your .env file.")
+        st.error("Google API Key not found. Set it in Streamlit Secrets or local .env.")
         return None
-    
+
     genai.configure(api_key=api_key)
-    # Using the latest reliable model
-    model = genai.GenerativeModel('gemini-2.5-flash-preview-09-2025')
-    print("[INFO] Gemini API configured.")
-    return model
 
-# --- CORE FUNCTIONS ---
+    # Prefer stable model names listed on official docs
+    preferred_models = [
+        "gemini-2.5-flash",
+        "gemini-2.5-pro",
+        "gemini-2.5-flash-lite",
+    ]
 
-def run_defect_detection(image_data, yolo_model):
+    # Try preferred models first
+    for name in preferred_models:
+        try:
+            model = genai.GenerativeModel(name)
+            _ = model.generate_content("ping")  # quick health-check call
+            print(f"[INFO] Gemini model OK: {name}")
+            return model
+        except Exception as e:
+            print(f"[WARN] Gemini model not usable: {name} -> {e}")
+
+    # Fallback: discover a model that supports generateContent
+    try:
+        for m in genai.list_models():
+            supported = getattr(m, "supported_generation_methods", [])
+            if "generateContent" in supported:
+                # m.name often looks like "models/gemini-xxx"
+                discovered_name = m.name.replace("models/", "")
+                model = genai.GenerativeModel(discovered_name)
+                _ = model.generate_content("ping")
+                print(f"[INFO] Gemini fallback model OK: {discovered_name}")
+                return model
+    except Exception as e:
+        print(f"[ERROR] Gemini list_models fallback failed: {e}")
+        st.error(f"Failed to find a usable Gemini model: {e}")
+        return None
+
+    st.error("No usable Gemini model found (generateContent not supported).")
+    return None
+
+
+# -----------------------------
+# Core: defect detection
+# -----------------------------
+def run_defect_detection(image_pil: Image.Image, yolo_model: YOLO, conf: float = 0.01):
     """
-    Run the YOLOv8 model on the uploaded image to detect defects.
-    It returns the annotated image and a list of found defects.
+    Run YOLO detection on the input image and return:
+    - annotated RGB image (numpy array) for display
+    - defect_list: list of dicts with 'type' and 'confidence'
     """
     print("[INFO] Running defect detection...")
-    image_np = np.array(image_data.convert('RGB'))
-    
-    # Run prediction, but set an *extremely* low confidence threshold (conf=0.01)
-    results = yolo_model.predict(image_np, conf=0.01)
-    
+
+    # Convert PIL -> RGB numpy
+    rgb = np.array(image_pil.convert("RGB"))
+
+    # OpenCV drawing should be done in BGR
+    bgr = cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR)
+    annotated_bgr = bgr.copy()
+
+    # YOLO can take RGB numpy arrays directly
+    results = yolo_model.predict(rgb, conf=conf)
+
     defect_list = []
-    annotated_image = image_np.copy()
-    
-    if results and results[0].boxes:
+
+    if results and len(results) > 0 and results[0].boxes is not None:
         boxes = results[0].boxes
-        # Get the class name map (e.g., 0: 'Dry_joint')
-        class_names = results[0].names 
+        class_names = results[0].names  # dict: class_index -> class_name
 
         for box in boxes:
             x1, y1, x2, y2 = map(int, box.xyxy[0])
             cls_index = int(box.cls[0])
-            cls_name = class_names.get(cls_index, 'Unknown')
+            cls_name = class_names.get(cls_index, "Unknown")
             confidence = float(box.conf[0])
-            
+
             defect_list.append({
                 "type": cls_name,
-                "confidence": f"{confidence*100:.2f}%"
+                "confidence": f"{confidence * 100:.2f}%"
             })
-            
-            # Draw bounding box (Red)
-            cv2.rectangle(annotated_image, (x1, y1), (x2, y2), (0, 0, 255), 2)
-            
-            label = f"{cls_name}: {confidence*100:.1f}%"
+
+            # Draw bounding box in red (BGR = 0,0,255)
+            cv2.rectangle(annotated_bgr, (x1, y1), (x2, y2), (0, 0, 255), 2)
+
+            label = f"{cls_name}: {confidence * 100:.1f}%"
             (w, h), _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.5, 1)
-            cv2.rectangle(annotated_image, (x1, y1 - h - 5), (x1 + w, y1), (0, 0, 255), -1)
-            cv2.putText(annotated_image, label, (x1, y1 - 5), 
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
+            cv2.rectangle(annotated_bgr, (x1, y1 - h - 6), (x1 + w, y1), (0, 0, 255), -1)
+            cv2.putText(
+                annotated_bgr, label, (x1, y1 - 6),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1
+            )
 
     print(f"[INFO] Detection complete. Found {len(defect_list)} defects.")
-    
-    # Convert annotated image from BGR (OpenCV default) back to RGB (PIL/Streamlit default)
-    annotated_image_rgb = cv2.cvtColor(annotated_image, cv2.COLOR_BGR2RGB) # <-- Fixed: _ to 2
-    
-    return annotated_image_rgb, defect_list
+
+    # Convert back to RGB for Streamlit display
+    annotated_rgb = cv2.cvtColor(annotated_bgr, cv2.COLOR_BGR2RGB)
+    return annotated_rgb, defect_list
 
 
-def generate_inspection_report(defect_list, gemini_model):
+# -----------------------------
+# Core: report generation
+# -----------------------------
+def generate_inspection_report(defect_list: list[dict], gemini_model) -> str:
     """
-    Generate a professional QC report using Gemini based on the defect list.
-    (This is updated for the 'keremberke' model's classes)
+    Generate a professional QC report using Gemini based on detected defects.
     """
-    print("[INFO] Generating AI Manager's report...")
+    print("[INFO] Generating QC report...")
+
     if not defect_list:
         return "PASS: No defects detected during visual inspection."
 
-    defect_string = "\n".join([f"- {d['type']} (Confidence: {d['confidence']})" for d in defect_list])
+    defect_string = "\n".join(
+        [f"- {d['type']} (Confidence: {d['confidence']})" for d in defect_list]
+    )
 
-    # This prompt is updated for the new model's defect classes
     prompt = f"""
-    You are an expert AI Quality Control Manager for an electronics production line.
-    An AOI tool has scanned a PCB and found the following potential defects:
+You are an expert AI Quality Control Manager for an electronics production line.
+An AOI tool scanned a PCB and found the following potential defects:
 
-    {defect_string}
+{defect_string}
 
-    Defect Guide:
-    - 'Dry_joint': A poor solder connection (虚焊).
-    - 'Incorrect_installation': A component is installed incorrectly (安装错误).
-    - 'PCB_damage': Physical damage to the board itself (PCB板损伤).
-    - 'Short_circuit': An improper connection between two points (短路).
+Defect Guide:
+- 'Dry_joint': A poor solder connection (cold solder / insufficient solder).
+- 'Incorrect_installation': A component is installed incorrectly.
+- 'PCB_damage': Physical damage to the PCB.
+- 'Short_circuit': An improper electrical connection between two points.
 
-    Your task is to write a concise, professional inspection report.
-    The report MUST include three sections:
-    1.  **Inspection Summary:** A one-sentence overview.
-    2.  **Detected Defects:** A bullet-point list of the items found.
-    3.  **Recommended Action:** A clear, actionable next step.
-    """
-    
+Write a concise, professional inspection report with exactly three sections:
+
+1. Inspection Summary: One sentence overview.
+2. Detected Defects: Bullet list of the items found (include confidence).
+3. Recommended Action: Clear and actionable next steps for QC/repair/rework.
+"""
+
     try:
         response = gemini_model.generate_content(prompt)
         print("[INFO] Report generated successfully.")
         return response.text
     except Exception as e:
-        print(f"[ERROR] Gemini API call failed: {e}")
+        print(f"[ERROR] Gemini generate_content failed: {e}")
         return f"Error generating report: {e}"
 
-# --- STREAMLIT UI ---
 
+# -----------------------------
+# Streamlit UI
+# -----------------------------
 st.title("🤖 AI Inspection Supporter")
-st.markdown("##### Upload a Printed Circuit Board (PCB) image to run an AI-powered defect inspection.")
+st.markdown("##### Upload a PCB image to run an AI-powered defect inspection.")
 
-# Load models
+with st.sidebar:
+    st.header("About This App")
+    st.info(
+        "This application demonstrates an 'Image-to-Report' pipeline.\n\n"
+        "1) A **YOLOv8** model detects visual defects.\n\n"
+        "2) **Gemini** generates a formal QC report from the detections."
+    )
+    st.caption("Security tip: use Streamlit Secrets in deployment and do not commit .env files.")
+
+
+# Load models (cached)
 yolo_model = load_yolo_model()
-gemini_model = configure_gemini_api()
+gemini_model = configure_gemini_model()
 
-st.sidebar.header("About This App")
-st.sidebar.info(
-    "This application demonstrates an 'Image-to-Report' pipeline. \n\n"
-    "1. A **YOLOv8** model (from Hugging Face) detects visual defects. \n\n"
-    "2. A **Generative AI** (Google Gemini) interprets the findings to write a formal QC report."
-)
-
-#
-# === THIS IS THE FIX (Line 195) ===
-#
-uploaded_file = st.file_uploader("Choose a PCB image...", type=["jpg", "jpeg", "png"]) # <-- Fixed: Removed _CHAR_
+uploaded_file = st.file_uploader("Choose a PCB image...", type=["jpg", "jpeg", "png"])
 
 if uploaded_file is not None:
     image = Image.open(uploaded_file)
+
     st.header("Inspection Results")
-    
+
     if yolo_model is None or gemini_model is None:
-        st.error("One of the AI models failed to load. Please check the terminal for errors.")
+        st.error("One of the AI models failed to load. Check logs and API key configuration.")
     else:
-        with st.spinner("Inspecting image with YOLOv8... (This may take a moment on first run)..."):
-            annotated_image, defect_list = run_defect_detection(image, yolo_model)
-        
+        with st.spinner("Inspecting image with YOLOv8..."):
+            annotated_image, defect_list = run_defect_detection(image, yolo_model, conf=0.01)
+
         if not defect_list:
-            st.success("✅ **Inspection PASSED**")
-            st.markdown("The AI vision model did not find any defects on this board.")
-            st.image(image, caption="Original Uploaded Image", use_column_width=True)
-        
+            st.success("✅ Inspection PASSED")
+            st.image(image, caption="Original Uploaded Image", use_container_width=True)
         else:
-            st.error(f"❌ **Inspection FAILED: {len(defect_list)} potential defects detected.**")
-            
-            with st.spinner("AI Manager is analyzing defects and writing the report..."):
+            st.error(f"❌ Inspection FAILED: {len(defect_list)} potential defects detected.")
+
+            with st.spinner("Generating QC report with Gemini..."):
                 report_text = generate_inspection_report(defect_list, gemini_model)
-            
+
             col1, col2 = st.columns(2)
-            
+
             with col1:
                 st.subheader("Annotated Defects")
-                st.image(annotated_image, caption="AI visual inspection results. Defects are marked in red.")
-            
+                st.image(annotated_image, caption="Defects are marked in red.", use_container_width=True)
+
             with col2:
                 st.subheader("AI Manager's Report")
                 st.markdown(report_text)
-
