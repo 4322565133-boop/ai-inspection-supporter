@@ -292,7 +292,7 @@ with st.sidebar:
     st.subheader("Detection Controls")
     st.caption(
         "Lower the confidence value to make the AI more sensitive (it may highlight more areas). "
-        "Increase it to be more conservative and reduce false alarms."
+        "Increase it to be looser and reduce false alarms."
     )
 
     conf_threshold = st.slider(
