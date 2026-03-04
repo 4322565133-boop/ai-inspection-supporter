@@ -249,27 +249,22 @@ with st.sidebar:
     )
 
     st.divider()
-    st.subheader("Detection Settings")
+    st.subheader("Detection Controls")
+    st.caption(
+    "If the AI misses defects, lower the confidence value so it looks more carefully. "
+    "If you see too many highlights, increase it to be more strict."
+    )
 
-    # Adjustable thresholds to reduce noisy boxes
     conf_threshold = st.slider(
-        "Confidence threshold (higher = fewer boxes)",
-        min_value=0.01,
-        max_value=0.80,
-        value=0.25,
-        step=0.01
+    "AI sensitivity (lower = more careful, more highlights)",
+    min_value=0.01,
+    max_value=0.80,
+    value=0.25,
+    step=0.01
     )
 
-    iou_threshold = st.slider(
-        "IoU threshold for NMS (lower = fewer duplicate boxes)",
-        min_value=0.10,
-        max_value=0.90,
-        value=0.50,
-        step=0.05
-    )
-
-    st.caption("Tip: Try conf=0.25~0.40 and IoU=0.45~0.60 for cleaner results.")
-
+    st.caption("Suggested range: 0.20–0.40 (start from 0.25).")
+   
 
 # Load models (cached)
 yolo_model = load_yolo_model()
