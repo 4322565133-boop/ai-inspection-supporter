@@ -5,11 +5,11 @@
 # 1) Detects PCB defects using a YOLOv8 model (weights hosted on Hugging Face).
 # 2) Generates a concise QC report using Google Gemini (Generative AI).
 #
-# Key fixes in this version:
-# - Use stable Gemini model names (avoid preview model names that can disappear).
-# - Add robust Gemini model fallback logic via list_models().
-# - Separate .env and .gitignore responsibilities (security best practice).
-# - Fix color-space handling (OpenCV drawing in BGR, display in RGB).
+# Key features:
+# - Uses stable Gemini model names + robust fallback via list_models().
+# - Uses Streamlit Secrets or local .env for API key.
+# - Correct color-space handling (OpenCV draws in BGR, Streamlit displays RGB).
+# - Adjustable YOLO thresholds (confidence + IoU) to reduce false positives.
 #
 # Author: HU KAIXIAO
 # ==============================================================================
@@ -42,16 +42,10 @@ st.set_page_config(
 def get_google_api_key() -> str | None:
     """
     Retrieve the Google API key from (1) Streamlit secrets, or (2) local .env file.
-
-    This allows:
-    - Local development via .env
-    - Streamlit Community Cloud deployment via Secrets
     """
-    # 1) Streamlit secrets (recommended in deployment)
     if "GOOGLE_API_KEY" in st.secrets:
         return st.secrets["GOOGLE_API_KEY"]
 
-    # 2) Local .env for dev
     load_dotenv()
     return os.getenv("GOOGLE_API_KEY")
 
@@ -65,7 +59,6 @@ def load_yolo_model():
     Load the YOLOv8 model for PCB defect detection.
     Downloads the weights explicitly from Hugging Face, then loads from local path.
     """
-    st.write("")  # No-op to avoid Streamlit warnings in some environments
     print("[INFO] Loading YOLOv8 PCB Defect Model...")
 
     model_id = "keremberke/yolov8s-pcb-defect-segmentation"
@@ -93,10 +86,7 @@ def load_yolo_model():
 def configure_gemini_model():
     """
     Configure Gemini and return a usable GenerativeModel instance.
-
-    Why fallback logic:
-    - Some model names can be unavailable depending on API/SDK versions.
-    - Preview model names can be removed or renamed, causing 404 errors.
+    Includes fallback logic to avoid 404 model issues.
     """
     print("[INFO] Configuring Gemini model...")
 
@@ -107,29 +97,25 @@ def configure_gemini_model():
 
     genai.configure(api_key=api_key)
 
-    # Prefer stable model names listed on official docs
     preferred_models = [
         "gemini-2.5-flash",
         "gemini-2.5-pro",
         "gemini-2.5-flash-lite",
     ]
 
-    # Try preferred models first
     for name in preferred_models:
         try:
             model = genai.GenerativeModel(name)
-            _ = model.generate_content("ping")  # quick health-check call
+            _ = model.generate_content("ping")
             print(f"[INFO] Gemini model OK: {name}")
             return model
         except Exception as e:
             print(f"[WARN] Gemini model not usable: {name} -> {e}")
 
-    # Fallback: discover a model that supports generateContent
     try:
         for m in genai.list_models():
             supported = getattr(m, "supported_generation_methods", [])
             if "generateContent" in supported:
-                # m.name often looks like "models/gemini-xxx"
                 discovered_name = m.name.replace("models/", "")
                 model = genai.GenerativeModel(discovered_name)
                 _ = model.generate_content("ping")
@@ -147,29 +133,35 @@ def configure_gemini_model():
 # -----------------------------
 # Core: defect detection
 # -----------------------------
-def run_defect_detection(image_pil: Image.Image, yolo_model: YOLO, conf: float = 0.01):
+def run_defect_detection(
+    image_pil: Image.Image,
+    yolo_model: YOLO,
+    conf: float = 0.25,
+    iou: float = 0.50
+):
     """
     Run YOLO detection on the input image and return:
     - annotated RGB image (numpy array) for display
     - defect_list: list of dicts with 'type' and 'confidence'
+
+    Notes:
+    - conf: confidence threshold (higher => fewer boxes)
+    - iou: IoU threshold for NMS (lower => fewer overlapping duplicate boxes)
     """
-    print("[INFO] Running defect detection...")
+    print(f"[INFO] Running defect detection (conf={conf}, iou={iou})...")
 
-    # Convert PIL -> RGB numpy
     rgb = np.array(image_pil.convert("RGB"))
-
-    # OpenCV drawing should be done in BGR
     bgr = cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR)
     annotated_bgr = bgr.copy()
 
-    # YOLO can take RGB numpy arrays directly
-    results = yolo_model.predict(rgb, conf=conf)
+    # Pass both confidence and IoU thresholds to reduce noisy detections
+    results = yolo_model.predict(rgb, conf=conf, iou=iou)
 
     defect_list = []
 
     if results and len(results) > 0 and results[0].boxes is not None:
         boxes = results[0].boxes
-        class_names = results[0].names  # dict: class_index -> class_name
+        class_names = results[0].names
 
         for box in boxes:
             x1, y1, x2, y2 = map(int, box.xyxy[0])
@@ -182,7 +174,6 @@ def run_defect_detection(image_pil: Image.Image, yolo_model: YOLO, conf: float =
                 "confidence": f"{confidence * 100:.2f}%"
             })
 
-            # Draw bounding box in red (BGR = 0,0,255)
             cv2.rectangle(annotated_bgr, (x1, y1), (x2, y2), (0, 0, 255), 2)
 
             label = f"{cls_name}: {confidence * 100:.1f}%"
@@ -195,7 +186,6 @@ def run_defect_detection(image_pil: Image.Image, yolo_model: YOLO, conf: float =
 
     print(f"[INFO] Detection complete. Found {len(defect_list)} defects.")
 
-    # Convert back to RGB for Streamlit display
     annotated_rgb = cv2.cvtColor(annotated_bgr, cv2.COLOR_BGR2RGB)
     return annotated_rgb, defect_list
 
@@ -257,7 +247,28 @@ with st.sidebar:
         "1) A **YOLOv8** model detects visual defects.\n\n"
         "2) **Gemini** generates a formal QC report from the detections."
     )
-    st.caption("Security tip: use Streamlit Secrets in deployment and do not commit .env files.")
+
+    st.divider()
+    st.subheader("Detection Settings")
+
+    # Adjustable thresholds to reduce noisy boxes
+    conf_threshold = st.slider(
+        "Confidence threshold (higher = fewer boxes)",
+        min_value=0.01,
+        max_value=0.80,
+        value=0.25,
+        step=0.01
+    )
+
+    iou_threshold = st.slider(
+        "IoU threshold for NMS (lower = fewer duplicate boxes)",
+        min_value=0.10,
+        max_value=0.90,
+        value=0.50,
+        step=0.05
+    )
+
+    st.caption("Tip: Try conf=0.25~0.40 and IoU=0.45~0.60 for cleaner results.")
 
 
 # Load models (cached)
@@ -268,14 +279,18 @@ uploaded_file = st.file_uploader("Choose a PCB image...", type=["jpg", "jpeg", "
 
 if uploaded_file is not None:
     image = Image.open(uploaded_file)
-
     st.header("Inspection Results")
 
     if yolo_model is None or gemini_model is None:
         st.error("One of the AI models failed to load. Check logs and API key configuration.")
     else:
         with st.spinner("Inspecting image with YOLOv8..."):
-            annotated_image, defect_list = run_defect_detection(image, yolo_model, conf=0.01)
+            annotated_image, defect_list = run_defect_detection(
+                image,
+                yolo_model,
+                conf=conf_threshold,
+                iou=iou_threshold
+            )
 
         if not defect_list:
             st.success("✅ Inspection PASSED")
