@@ -298,11 +298,11 @@ with st.sidebar:
     conf_threshold = st.slider(
         "AI sensitivity (lower = more careful, more highlights)",
         min_value=0.01,
-        max_value=0.80,
+        max_value=0.50,
         value=0.25,
         step=0.01,
     )
-    st.caption("Suggested range: 0.20–0.40 (start from 0.25).")
+    st.caption("Suggested range: 0.02–0.20 (start from 0.25).")
 
 
 # Load models (cached)
