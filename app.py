@@ -5,20 +5,21 @@
 # 1) Detects PCB defects using a YOLOv8 model (weights hosted on Hugging Face).
 # 2) Generates a concise QC report using Google Gemini (Generative AI).
 #
-# Key features:
-# - Uses stable Gemini model names + robust fallback via list_models().
-# - Uses Streamlit Secrets or local .env for API key.
-# - Correct color-space handling (OpenCV draws in BGR, Streamlit displays RGB).
-# - Adjustable YOLO thresholds (confidence + IoU) to reduce false positives.
+# Stability choices:
+# - Avoid OpenCV (cv2) to prevent missing-system-library errors on Streamlit Cloud.
+# - Use PIL to draw bounding boxes and labels.
 #
 # Author: HU KAIXIAO
 # ==============================================================================
 
+from __future__ import annotations
+
 import os
+from typing import Optional, Any, List, Dict, Tuple
+
 import streamlit as st
 import numpy as np
-import cv2
-from PIL import Image
+from PIL import Image, ImageDraw, ImageFont
 from dotenv import load_dotenv
 
 import google.generativeai as genai
@@ -32,47 +33,46 @@ from huggingface_hub import hf_hub_download
 st.set_page_config(
     page_title="AI Inspection Supporter",
     page_icon="🤖",
-    layout="wide"
+    layout="wide",
 )
 
 
 # -----------------------------
-# Utilities: key loading
+# API key loading
 # -----------------------------
-def get_google_api_key() -> str | None:
+def get_google_api_key() -> Optional[str]:
     """
-    Retrieve the Google API key from (1) Streamlit secrets, or (2) local .env file.
+    Retrieve Google API key from:
+    1) Streamlit Secrets (recommended for deployment)
+    2) Local .env file (for local development)
     """
     if "GOOGLE_API_KEY" in st.secrets:
-        return st.secrets["GOOGLE_API_KEY"]
+        return str(st.secrets["GOOGLE_API_KEY"])
 
     load_dotenv()
     return os.getenv("GOOGLE_API_KEY")
 
 
 # -----------------------------
-# Model loading: YOLO
+# YOLO model loading
 # -----------------------------
 @st.cache_resource
-def load_yolo_model():
+def load_yolo_model() -> Optional[YOLO]:
     """
-    Load the YOLOv8 model for PCB defect detection.
-    Downloads the weights explicitly from Hugging Face, then loads from local path.
+    Download the YOLOv8 weights from Hugging Face and load them locally.
+    Uses Hugging Face caching automatically.
     """
-    print("[INFO] Loading YOLOv8 PCB Defect Model...")
-
     model_id = "keremberke/yolov8s-pcb-defect-segmentation"
     filename = "best.pt"
 
     try:
-        print(f"[INFO] Downloading weights '{filename}' from '{model_id}'...")
-        local_model_path = hf_hub_download(repo_id=model_id, filename=filename)
-        print(f"[INFO] Weights downloaded/cached at: {local_model_path}")
+        print("[INFO] Loading YOLOv8 PCB Defect Model...")
+        local_path = hf_hub_download(repo_id=model_id, filename=filename)
+        print(f"[INFO] Weights downloaded/cached at: {local_path}")
 
-        model = YOLO(local_model_path)
+        model = YOLO(local_path)
         print("[INFO] YOLO model loaded successfully.")
         return model
-
     except Exception as e:
         print(f"[ERROR] YOLO loading failed: {e}")
         st.error(f"Failed to download or load YOLO model: {e}")
@@ -80,19 +80,21 @@ def load_yolo_model():
 
 
 # -----------------------------
-# Model loading: Gemini
+# Gemini model loading (with fallback)
 # -----------------------------
 @st.cache_resource
-def configure_gemini_model():
+def load_gemini_model() -> Optional[Any]:
     """
     Configure Gemini and return a usable GenerativeModel instance.
-    Includes fallback logic to avoid 404 model issues.
+
+    Includes fallback logic to avoid 404 issues when certain model names
+    are unavailable under a given API/SDK version.
     """
     print("[INFO] Configuring Gemini model...")
 
     api_key = get_google_api_key()
     if not api_key:
-        st.error("Google API Key not found. Set it in Streamlit Secrets or local .env.")
+        st.error("Google API Key not found. Set GOOGLE_API_KEY in Streamlit Secrets or local .env.")
         return None
 
     genai.configure(api_key=api_key)
@@ -103,26 +105,28 @@ def configure_gemini_model():
         "gemini-2.5-flash-lite",
     ]
 
+    # Try preferred models first
     for name in preferred_models:
         try:
             model = genai.GenerativeModel(name)
-            _ = model.generate_content("ping")
+            _ = model.generate_content("ping")  # quick health check
             print(f"[INFO] Gemini model OK: {name}")
             return model
         except Exception as e:
             print(f"[WARN] Gemini model not usable: {name} -> {e}")
 
+    # Fallback: find any model that supports generateContent
     try:
         for m in genai.list_models():
-            supported = getattr(m, "supported_generation_methods", [])
-            if "generateContent" in supported:
-                discovered_name = m.name.replace("models/", "")
+            methods = getattr(m, "supported_generation_methods", []) or []
+            if "generateContent" in methods:
+                discovered_name = str(m.name).replace("models/", "")
                 model = genai.GenerativeModel(discovered_name)
                 _ = model.generate_content("ping")
                 print(f"[INFO] Gemini fallback model OK: {discovered_name}")
                 return model
     except Exception as e:
-        print(f"[ERROR] Gemini list_models fallback failed: {e}")
+        print(f"[ERROR] Gemini fallback failed: {e}")
         st.error(f"Failed to find a usable Gemini model: {e}")
         return None
 
@@ -131,37 +135,83 @@ def configure_gemini_model():
 
 
 # -----------------------------
+# Drawing utilities (PIL)
+# -----------------------------
+def load_font() -> ImageFont.ImageFont:
+    """
+    Load a font for label rendering.
+    Falls back to a default bitmap font if TrueType fonts are unavailable.
+    """
+    try:
+        # Many Linux environments have DejaVuSans available.
+        return ImageFont.truetype("DejaVuSans.ttf", size=14)
+    except Exception:
+        return ImageFont.load_default()
+
+
+def draw_boxes_pil(
+    image_rgb: Image.Image,
+    boxes_xyxy: List[Tuple[int, int, int, int]],
+    labels: List[str],
+) -> Image.Image:
+    """
+    Draw bounding boxes and labels on an RGB PIL image.
+    """
+    img = image_rgb.copy()
+    draw = ImageDraw.Draw(img)
+    font = load_font()
+
+    for (x1, y1, x2, y2), label in zip(boxes_xyxy, labels):
+        # Red rectangle
+        draw.rectangle([x1, y1, x2, y2], outline=(255, 0, 0), width=3)
+
+        # Label background
+        text_w, text_h = draw.textbbox((0, 0), label, font=font)[2:]
+        pad = 4
+        bg_x1 = x1
+        bg_y1 = max(0, y1 - text_h - pad * 2)
+        bg_x2 = x1 + text_w + pad * 2
+        bg_y2 = bg_y1 + text_h + pad * 2
+
+        draw.rectangle([bg_x1, bg_y1, bg_x2, bg_y2], fill=(255, 0, 0))
+        draw.text((bg_x1 + pad, bg_y1 + pad), label, fill=(255, 255, 255), font=font)
+
+    return img
+
+
+# -----------------------------
 # Core: defect detection
 # -----------------------------
 def run_defect_detection(
     image_pil: Image.Image,
     yolo_model: YOLO,
-    conf: float = 0.25,
-    iou: float = 0.50
-):
+    conf: float,
+) -> Tuple[Image.Image, List[Dict[str, str]]]:
     """
-    Run YOLO detection on the input image and return:
-    - annotated RGB image (numpy array) for display
+    Run YOLO detection on the input image.
+
+    Parameters:
+    - conf: confidence threshold. Lower => more sensitive (more boxes).
+            Higher => more conservative (fewer boxes).
+
+    Returns:
+    - annotated PIL image (RGB) for display
     - defect_list: list of dicts with 'type' and 'confidence'
-
-    Notes:
-    - conf: confidence threshold (higher => fewer boxes)
-    - iou: IoU threshold for NMS (lower => fewer overlapping duplicate boxes)
     """
-    print(f"[INFO] Running defect detection (conf={conf}, iou={iou})...")
+    print(f"[INFO] Running defect detection (conf={conf})...")
 
-    rgb = np.array(image_pil.convert("RGB"))
-    bgr = cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR)
-    annotated_bgr = bgr.copy()
+    rgb_pil = image_pil.convert("RGB")
+    rgb_np = np.array(rgb_pil)
 
-    # Pass both confidence and IoU thresholds to reduce noisy detections
-    results = yolo_model.predict(rgb, conf=conf, iou=iou)
+    results = yolo_model.predict(rgb_np, conf=conf)
 
-    defect_list = []
+    defect_list: List[Dict[str, str]] = []
+    drawn_boxes: List[Tuple[int, int, int, int]] = []
+    labels: List[str] = []
 
     if results and len(results) > 0 and results[0].boxes is not None:
         boxes = results[0].boxes
-        class_names = results[0].names
+        class_names = results[0].names  # dict: class_index -> class_name
 
         for box in boxes:
             x1, y1, x2, y2 = map(int, box.xyxy[0])
@@ -169,33 +219,23 @@ def run_defect_detection(
             cls_name = class_names.get(cls_index, "Unknown")
             confidence = float(box.conf[0])
 
-            defect_list.append({
-                "type": cls_name,
-                "confidence": f"{confidence * 100:.2f}%"
-            })
-
-            cv2.rectangle(annotated_bgr, (x1, y1), (x2, y2), (0, 0, 255), 2)
-
-            label = f"{cls_name}: {confidence * 100:.1f}%"
-            (w, h), _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.5, 1)
-            cv2.rectangle(annotated_bgr, (x1, y1 - h - 6), (x1 + w, y1), (0, 0, 255), -1)
-            cv2.putText(
-                annotated_bgr, label, (x1, y1 - 6),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1
+            defect_list.append(
+                {"type": cls_name, "confidence": f"{confidence * 100:.2f}%"}
             )
+            drawn_boxes.append((x1, y1, x2, y2))
+            labels.append(f"{cls_name}: {confidence * 100:.1f}%")
 
+    annotated = draw_boxes_pil(rgb_pil, drawn_boxes, labels)
     print(f"[INFO] Detection complete. Found {len(defect_list)} defects.")
-
-    annotated_rgb = cv2.cvtColor(annotated_bgr, cv2.COLOR_BGR2RGB)
-    return annotated_rgb, defect_list
+    return annotated, defect_list
 
 
 # -----------------------------
 # Core: report generation
 # -----------------------------
-def generate_inspection_report(defect_list: list[dict], gemini_model) -> str:
+def generate_inspection_report(defect_list: List[Dict[str, str]], gemini_model: Any) -> str:
     """
-    Generate a professional QC report using Gemini based on detected defects.
+    Generate a concise QC report using Gemini based on detected defects.
     """
     print("[INFO] Generating QC report...")
 
@@ -242,7 +282,7 @@ st.markdown("##### Upload a PCB image to run an AI-powered defect inspection.")
 
 with st.sidebar:
     st.header("About This App")
-    st.info(
+    st.sidebar.info(
         "This application demonstrates an 'Image-to-Report' pipeline.\n\n"
         "1) A **YOLOv8** model detects visual defects.\n\n"
         "2) **Gemini** generates a formal QC report from the detections."
@@ -251,24 +291,23 @@ with st.sidebar:
     st.divider()
     st.subheader("Detection Controls")
     st.caption(
-    "If the AI misses defects, lower the confidence value so it looks more carefully. "
-    "If you see too many highlights, increase it to be more strict."
+        "Lower the confidence value to make the AI more sensitive (it may highlight more areas). "
+        "Increase it to be more conservative and reduce false alarms."
     )
 
     conf_threshold = st.slider(
-    "AI sensitivity (lower = more careful, more highlights)",
-    min_value=0.01,
-    max_value=0.80,
-    value=0.25,
-    step=0.01
+        "AI sensitivity (lower = more careful, more highlights)",
+        min_value=0.01,
+        max_value=0.80,
+        value=0.25,
+        step=0.01,
     )
-
     st.caption("Suggested range: 0.20–0.40 (start from 0.25).")
-   
+
 
 # Load models (cached)
 yolo_model = load_yolo_model()
-gemini_model = configure_gemini_model()
+gemini_model = load_gemini_model()
 
 uploaded_file = st.file_uploader("Choose a PCB image...", type=["jpg", "jpeg", "png"])
 
@@ -281,10 +320,9 @@ if uploaded_file is not None:
     else:
         with st.spinner("Inspecting image with YOLOv8..."):
             annotated_image, defect_list = run_defect_detection(
-                image,
-                yolo_model,
+                image_pil=image,
+                yolo_model=yolo_model,
                 conf=conf_threshold,
-                iou=iou_threshold
             )
 
         if not defect_list:
